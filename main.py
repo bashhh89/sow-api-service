@@ -1,3 +1,8 @@
+# main.py
+# FINAL VERSION
+# This API receives a workspace and chat ID, fetches the last message from AnythingLLM,
+# converts it to a DOCX using a template, uploads it, and returns a download link.
+
 import io
 import os
 import re
@@ -8,148 +13,120 @@ from docx import Document
 from docx.shared import Pt
 from docx.table import _Cell
 
+# --- CONFIGURATION ---
+# These will be loaded from environment variables in your Easypanel setup
+ANYTHINGLLM_API_URL = os.environ.get("ANYTHINGLLM_API_URL") # e.g., "http://192.168.1.5:3001"
+ANYTHINGLLM_API_KEY = os.environ.get("ANYTHINGLLM_API_KEY")
+
 # Initialize the FastAPI app
 app = FastAPI(
-    title="Markdown to DOCX Converter",
-    description="An API that receives Markdown text, creates a .docx file, uploads it, and returns a download link.",
-    version="1.2.0",
+    title="Smart SOW Document Converter",
+    description="An API that pulls chat history from AnythingLLM to generate a .docx file.",
+    version="2.0.0",
 )
 
-# Pydantic models for API request and response
-class MarkdownRequest(BaseModel):
-    markdown_text: str
-    filename: str = "document.docx"
+# --- Pydantic Models ---
+class ConversionRequest(BaseModel):
+    workspace_slug: str
+    chat_id: str
+    filename: str = "SOW-Document.docx"
 
 class ConversionResponse(BaseModel):
     status: str
     download_url: str
 
-
+# --- Helper Functions (No changes here) ---
 def parse_and_add_paragraph(paragraph_text: str, document: Document):
-    """
-    Parses a line of text for inline markdown (bold, italic) and adds
-    it to the document with appropriate formatting.
-    """
     p = document.add_paragraph()
-    # This pattern finds ***text*** (bold/italic), **text** (bold), or *text* (italic)
     pattern = r'(\*\*\*.*?\*\*\*|\*\*.*?\*\*|\*.*?\*)'
     parts = re.split(pattern, paragraph_text)
-    
     for part in parts:
         if part.startswith('***') and part.endswith('***'):
-            run = p.add_run(part[3:-3])
-            run.bold = True
-            run.italic = True
+            run = p.add_run(part[3:-3]); run.bold = True; run.italic = True
         elif part.startswith('**') and part.endswith('**'):
-            run = p.add_run(part[2:-2])
-            run.bold = True
+            run = p.add_run(part[2:-2]); run.bold = True
         elif part.startswith('*') and part.endswith('*'):
-            run = p.add_run(part[1:-1])
-            run.italic = True
-        elif part:
-            p.add_run(part)
+            run = p.add_run(part[1:-1]); run.italic = True
+        elif part: p.add_run(part)
 
-@app.post("/convert/markdown-to-docx", 
-          response_model=ConversionResponse,
-          summary="Convert Markdown to a DOCX Download Link",
-          description="Takes Markdown text, creates a .docx file using 'template.docx' if available, uploads it, and returns a public download link.")
-async def convert_markdown_to_docx(request: MarkdownRequest):
-    """
-    This endpoint processes incoming Markdown, creates a DOCX file,
-    uploads it to a temporary hosting service, and returns a download link.
-    """
-    markdown_text = request.markdown_text
-    template_path = 'template.docx'
-
-    # --- TEMPLATE HANDLING ---
-    if os.path.exists(template_path):
-        document = Document(template_path)
-        document.add_paragraph() 
-    else:
-        document = Document()
-        style = document.styles['Normal']
-        font = style.font
-        font.name = 'Calibri'
-        font.size = Pt(11)
-
-    # --- PARSING LOGIC ---
+def create_docx_from_markdown(markdown_text: str, document: Document):
     lines = markdown_text.split('\n')
-    in_table = False
-    table_data = []
-    i = 0
+    in_table, table_data, i = False, [], 0
     while i < len(lines):
         line = lines[i].strip()
-        # (Table, Heading, and List parsing logic remains the same)
         if line.startswith('|') and line.endswith('|'):
             if not in_table: in_table = True
             table_data.append([cell.strip() for cell in line.strip('|').split('|')])
-            i += 1
-            continue
+            i += 1; continue
         elif in_table:
             in_table = False
             if table_data:
                 headers = table_data[0]
                 records = table_data[2:] if len(table_data) > 1 and '---' in table_data[1][0] else table_data[1:]
-                table = document.add_table(rows=1, cols=len(headers))
-                table.style = 'Table Grid'
+                table = document.add_table(rows=1, cols=len(headers)); table.style = 'Table Grid'
                 hdr_cells = table.rows[0].cells
                 for j, header in enumerate(headers):
-                    hdr_cells[j].text = header
-                    hdr_cells[j].paragraphs[0].runs[0].bold = True
+                    hdr_cells[j].text = header; hdr_cells[j].paragraphs[0].runs[0].bold = True
                 for record in records:
                     row_cells = table.add_row().cells
-                    for j, cell_text in enumerate(record):
-                        row_cells[j].text = cell_text
+                    for j, cell_text in enumerate(record): row_cells[j].text = cell_text
             table_data = []
-        
-        if i < len(lines) and lines[i].strip().startswith('|'):
-             continue
+        if i < len(lines) and lines[i].strip().startswith('|'): continue
         if line.startswith('# '): document.add_heading(line[2:], level=1)
         elif line.startswith('## '): document.add_heading(line[3:], level=2)
         elif line.startswith('### '): document.add_heading(line[4:], level=3)
         elif line.startswith('* '):
-            parse_and_add_paragraph(line[2:], document)
-            document.paragraphs[-1].style = 'List Bullet'
+            parse_and_add_paragraph(line[2:], document); document.paragraphs[-1].style = 'List Bullet'
         elif line.strip() == '---': document.add_page_break()
         elif line.strip(): parse_and_add_paragraph(line, document)
         i += 1
 
-    # --- FILE PREPARATION & UPLOAD ---
+# --- The Main API Endpoint ---
+@app.post("/generate-from-chat", response_model=ConversionResponse)
+async def generate_from_chat(request: ConversionRequest):
+    if not ANYTHINGLLM_API_URL or not ANYTHINGLLM_API_KEY:
+        raise HTTPException(status_code=500, detail="Server is not configured with AnythingLLM API credentials.")
+
+    # Step 1: Fetch chat history from AnythingLLM API
+    history_url = f"{ANYTHINGLLM_API_URL}/api/v1/workspace/{request.workspace_slug}/chat/{request.chat_id}/history"
+    headers = {"Authorization": f"Bearer {ANYTHINGLLM_API_KEY}"}
+    try:
+        response = requests.get(history_url, headers=headers, timeout=15)
+        response.raise_for_status()
+        history = response.json()
+    except requests.exceptions.RequestException as e:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch chat history from AnythingLLM: {e}")
+
+    # Find the last message from the 'assistant' that isn't an error message
+    markdown_text = ""
+    for message in reversed(history.get('history', [])):
+        if message.get('role') == 'assistant' and "unable to directly export" not in message.get('text', '').lower():
+            markdown_text = message.get('text')
+            break
+            
+    if not markdown_text:
+        raise HTTPException(status_code=404, detail="Could not find a suitable SOW message in the chat history.")
+
+    # Step 2: Create the DOCX file
+    template_path = 'template.docx'
+    document = Document(template_path) if os.path.exists(template_path) else Document()
+    create_docx_from_markdown(markdown_text, document)
+
+    # Step 3: Upload the file
     file_stream = io.BytesIO()
     document.save(file_stream)
     file_stream.seek(0)
-
-    # --- UPLOAD TO GOFILE.IO ---
     try:
-        # Step 1: Get the best available server from GoFile's API
         server_response = requests.get('https://api.gofile.io/getServer', timeout=10)
-        server_response.raise_for_status()
         server = server_response.json()['data']['server']
-        
-        # Step 2: Upload the in-memory file to the server
         upload_url = f'https://{server}.gofile.io/uploadFile'
-        files = {
-            'file': (request.filename, file_stream.read(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')
-        }
+        files = {'file': (request.filename, file_stream.read(), 'application/vnd.openxmlformats-officedocument.wordprocessingml.document')}
         upload_response = requests.post(upload_url, files=files, timeout=30)
-        upload_response.raise_for_status()
-        
         upload_data = upload_response.json()
-
         if upload_data.get("status") == "ok":
-            download_link = upload_data['data']['downloadPage']
-            return {"status": "success", "download_url": download_link}
+            return {"status": "success", "download_url": upload_data['data']['downloadPage']}
         else:
-            # If GoFile reports an error, relay it.
-            raise HTTPException(status_code=500, detail=f"File hosting service failed: {upload_data.get('status')}")
-
-    except requests.exceptions.RequestException as e:
-        raise HTTPException(status_code=502, detail=f"Error communicating with file hosting service: {e}")
+            raise HTTPException(status_code=500, detail="File hosting service failed.")
     except Exception as e:
-        # Catch any other unexpected errors.
-        raise HTTPException(status_code=500, detail=f"An unexpected error occurred during file upload: {e}")
+        raise HTTPException(status_code=502, detail=f"File upload error: {e}")
 
-
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
